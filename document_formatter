@@ -1,0 +1,586 @@
+"""
+Smart Document Formatter
+-----------------------
+A Windows-friendly desktop application for applying predefined formatting
+presets to existing Microsoft Word (.docx) documents.
+
+Requirements:
+    pip install python-docx
+
+Run:
+    python smart_document_formatter.py
+
+Notes:
+- The original file is never overwritten; output is saved separately.
+- The program formats existing paragraphs and tables. It does not rewrite text.
+- Existing images, tables, hyperlinks, headers, footers and section breaks are
+  generally retained, but complex layouts should always be checked afterwards.
+- Citation/reference formatting is a layout aid, not a citation validator.
+"""
+
+from __future__ import annotations
+
+import os
+import re
+import shutil
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+from pathlib import Path
+
+try:
+    from docx import Document
+    from docx.enum.text import WD_ALIGN_PARAGRAPH, WD_BREAK
+    from docx.enum.table import WD_TABLE_ALIGNMENT, WD_CELL_VERTICAL_ALIGNMENT
+    from docx.shared import Inches, Pt, RGBColor
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+except ImportError:
+    _root = tk.Tk()
+    _root.withdraw()
+    messagebox.showerror(
+        "Missing dependency",
+        "The python-docx package is required.\n\n"
+        "Install it with:\n    pip install python-docx"
+    )
+    raise SystemExit(1)
+
+
+# ---------------------------------------------------------------------------
+# PRESET LIBRARY
+# Measurements are in inches; font sizes are in points.
+# These are practical starting templates. Institutions may have their own rules.
+# ---------------------------------------------------------------------------
+
+PRESETS = {
+    "Academic Work": {
+        "APA 7th Edition": dict(font="Times New Roman", size=12, line=2.0,
+            before=0, after=0, first_indent=0.5, left=1, right=1,
+            top=1, bottom=1, alignment="left", heading_color="000000"),
+        "MLA 9th Edition": dict(font="Times New Roman", size=12, line=2.0,
+            before=0, after=0, first_indent=0.5, left=1, right=1,
+            top=1, bottom=1, alignment="left", heading_color="000000"),
+        "Harvard Referencing": dict(font="Times New Roman", size=12, line=1.5,
+            before=0, after=6, first_indent=0, left=1.25, right=1,
+            top=1, bottom=1, alignment="justify", heading_color="000000"),
+        "Chicago Style": dict(font="Times New Roman", size=12, line=2.0,
+            before=0, after=0, first_indent=0.5, left=1, right=1,
+            top=1, bottom=1, alignment="justify", heading_color="000000"),
+        "IEEE Style": dict(font="Times New Roman", size=10, line=1.0,
+            before=0, after=3, first_indent=0, left=0.75, right=0.75,
+            top=0.75, bottom=0.75, alignment="justify", heading_color="000000"),
+        "General University Standard": dict(font="Times New Roman", size=12,
+            line=1.5, before=0, after=6, first_indent=0.3, left=1.5,
+            right=1, top=1, bottom=1, alignment="justify",
+            heading_color="000000"),
+    },
+    "Resume / CV": {
+        "Professional CV": dict(font="Arial", size=10.5, line=1.08,
+            before=0, after=4, first_indent=0, left=0.65, right=0.65,
+            top=0.55, bottom=0.55, alignment="left", heading_color="17365D"),
+        "Graduate Resume": dict(font="Calibri", size=10.5, line=1.0,
+            before=0, after=3, first_indent=0, left=0.65, right=0.65,
+            top=0.55, bottom=0.55, alignment="left", heading_color="1F4E79"),
+        "ATS-Friendly Resume": dict(font="Arial", size=10, line=1.0,
+            before=0, after=3, first_indent=0, left=0.7, right=0.7,
+            top=0.6, bottom=0.6, alignment="left", heading_color="000000"),
+        "Modern Resume": dict(font="Aptos", size=10.5, line=1.08,
+            before=0, after=5, first_indent=0, left=0.7, right=0.7,
+            top=0.6, bottom=0.6, alignment="left", heading_color="24527A"),
+    },
+    "Business Documents": {
+        "Corporate Report": dict(font="Arial", size=10.5, line=1.15,
+            before=0, after=6, first_indent=0, left=1, right=1,
+            top=0.8, bottom=0.8, alignment="justify", heading_color="1F4E79"),
+        "Business Proposal": dict(font="Calibri", size=11, line=1.15,
+            before=0, after=6, first_indent=0, left=1, right=1,
+            top=0.8, bottom=0.8, alignment="justify", heading_color="17365D"),
+        "Project Report": dict(font="Arial", size=11, line=1.5,
+            before=0, after=6, first_indent=0, left=1, right=1,
+            top=1, bottom=1, alignment="justify", heading_color="17365D"),
+    },
+    "Formal Letters": {
+        "Official Letter": dict(font="Times New Roman", size=12, line=1.15,
+            before=0, after=8, first_indent=0, left=1, right=1,
+            top=1, bottom=1, alignment="left", heading_color="000000"),
+        "Application Letter": dict(font="Arial", size=11, line=1.15,
+            before=0, after=8, first_indent=0, left=1, right=1,
+            top=1, bottom=1, alignment="left", heading_color="000000"),
+        "Cover Letter": dict(font="Calibri", size=11, line=1.15,
+            before=0, after=8, first_indent=0, left=0.9, right=0.9,
+            top=0.8, bottom=0.8, alignment="left", heading_color="000000"),
+    },
+    "Research Publications": {
+        "Journal Manuscript": dict(font="Times New Roman", size=12, line=2.0,
+            before=0, after=0, first_indent=0.5, left=1, right=1,
+            top=1, bottom=1, alignment="justify", heading_color="000000"),
+        "Conference Paper": dict(font="Times New Roman", size=10, line=1.0,
+            before=0, after=4, first_indent=0, left=0.7, right=0.7,
+            top=0.7, bottom=0.7, alignment="justify", heading_color="000000"),
+        "Scientific Article": dict(font="Arial", size=10.5, line=1.15,
+            before=0, after=6, first_indent=0, left=0.8, right=0.8,
+            top=0.8, bottom=0.8, alignment="justify", heading_color="000000"),
+    },
+    "Books and E-books": {
+        "Textbook": dict(font="Cambria", size=11, line=1.3,
+            before=0, after=7, first_indent=0.25, left=0.9, right=0.9,
+            top=0.8, bottom=0.8, alignment="justify", heading_color="17365D"),
+        "Educational Notes": dict(font="Calibri", size=11, line=1.3,
+            before=0, after=6, first_indent=0, left=0.85, right=0.85,
+            top=0.8, bottom=0.8, alignment="justify", heading_color="1F4E79"),
+        "Book Manuscript": dict(font="Garamond", size=12, line=1.5,
+            before=0, after=4, first_indent=0.3, left=1, right=1,
+            top=1, bottom=1, alignment="justify", heading_color="000000"),
+    },
+    "Meeting Documents": {
+        "Meeting Minutes": dict(font="Arial", size=10.5, line=1.15,
+            before=0, after=6, first_indent=0, left=0.8, right=0.8,
+            top=0.7, bottom=0.7, alignment="left", heading_color="1F4E79"),
+        "Meeting Agenda": dict(font="Arial", size=11, line=1.15,
+            before=0, after=8, first_indent=0, left=0.8, right=0.8,
+            top=0.7, bottom=0.7, alignment="left", heading_color="1F4E79"),
+        "Action Plan": dict(font="Calibri", size=11, line=1.15,
+            before=0, after=6, first_indent=0, left=0.8, right=0.8,
+            top=0.7, bottom=0.7, alignment="left", heading_color="17365D"),
+    },
+    "General Documents": {
+        "Clean Notes": dict(font="Calibri", size=11, line=1.15,
+            before=0, after=6, first_indent=0, left=0.85, right=0.85,
+            top=0.8, bottom=0.8, alignment="left", heading_color="1F4E79"),
+        "Standard Document": dict(font="Arial", size=11, line=1.15,
+            before=0, after=6, first_indent=0, left=1, right=1,
+            top=1, bottom=1, alignment="justify", heading_color="000000"),
+    },
+}
+
+ALIGNMENTS = {
+    "left": WD_ALIGN_PARAGRAPH.LEFT,
+    "justify": WD_ALIGN_PARAGRAPH.JUSTIFY,
+    "center": WD_ALIGN_PARAGRAPH.CENTER,
+    "right": WD_ALIGN_PARAGRAPH.RIGHT,
+}
+
+
+def set_cell_shading(cell, fill="D9EAF7"):
+    """Apply a light background to a table cell."""
+    tc_pr = cell._tc.get_or_add_tcPr()
+    shd = tc_pr.find(qn("w:shd"))
+    if shd is None:
+        shd = OxmlElement("w:shd")
+        tc_pr.append(shd)
+    shd.set(qn("w:fill"), fill)
+
+
+def set_cell_border(cell, **kwargs):
+    """Set table cell borders. Example: bottom={'val':'single','sz':'4','color':'B7C9D6'}."""
+    tc = cell._tc
+    tc_pr = tc.get_or_add_tcPr()
+    borders = tc_pr.first_child_found_in("w:tcBorders")
+    if borders is None:
+        borders = OxmlElement("w:tcBorders")
+        tc_pr.append(borders)
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        if edge in kwargs:
+            tag = "w:{}".format(edge)
+            element = borders.find(qn(tag))
+            if element is None:
+                element = OxmlElement(tag)
+                borders.append(element)
+            for key in ["val", "sz", "space", "color"]:
+                if key in kwargs[edge]:
+                    element.set(qn("w:" + key), str(kwargs[edge][key]))
+
+
+def set_run_font(run, font_name, size, bold=None, color=None):
+    run.font.name = font_name
+    run._element.get_or_add_rPr().rFonts.set(qn("w:eastAsia"), font_name)
+    run.font.size = Pt(size)
+    if bold is not None:
+        run.bold = bold
+    if color:
+        run.font.color.rgb = RGBColor.from_string(color)
+
+
+def set_page_number(paragraph):
+    """Insert a Word PAGE field in the paragraph."""
+    paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+    run = paragraph.add_run()
+    begin = OxmlElement("w:fldChar")
+    begin.set(qn("w:fldCharType"), "begin")
+    instruction = OxmlElement("w:instrText")
+    instruction.set(qn("xml:space"), "preserve")
+    instruction.text = " PAGE "
+    separate = OxmlElement("w:fldChar")
+    separate.set(qn("w:fldCharType"), "separate")
+    display = OxmlElement("w:t")
+    display.text = "1"
+    end = OxmlElement("w:fldChar")
+    end.set(qn("w:fldCharType"), "end")
+    run._r.append(begin)
+    run._r.append(instruction)
+    run._r.append(separate)
+    run._r.append(display)
+    run._r.append(end)
+
+
+def paragraph_kind(paragraph):
+    """Identify paragraphs using existing Word styles and conservative heuristics."""
+    style_name = (paragraph.style.name or "").lower() if paragraph.style else ""
+    text = paragraph.text.strip()
+
+    if not text:
+        return "empty"
+    if "title" in style_name:
+        return "title"
+    if "heading 1" in style_name or "chapter" in style_name:
+        return "h1"
+    if "heading 2" in style_name:
+        return "h2"
+    if "heading 3" in style_name:
+        return "h3"
+    if "subtitle" in style_name:
+        return "subtitle"
+
+    # Only infer headings for short, standalone, non-sentence-like paragraphs.
+    if len(text) <= 90 and len(text.split()) <= 12:
+        if re.match(r"^(chapter|section)\s+[\w.-]+", text, re.I):
+            return "h1"
+        if re.match(r"^\d+(\.\d+){0,2}\s+\S", text):
+            depth = text.split()[0].count(".")
+            return "h1" if depth == 0 else ("h2" if depth == 1 else "h3")
+        if text.isupper() and len(text.split()) <= 10:
+            return "h2"
+    return "body"
+
+
+def apply_paragraph_format(paragraph, preset, kind):
+    paragraph_format = paragraph.paragraph_format
+    paragraph_format.widow_control = True
+
+    if kind == "empty":
+        return
+
+    paragraph_format.line_spacing = preset["line"]
+    paragraph_format.space_before = Pt(preset["before"])
+    paragraph_format.space_after = Pt(preset["after"])
+    paragraph_format.keep_together = False
+
+    if kind == "title":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph_format.first_line_indent = Inches(0)
+        paragraph_format.space_before = Pt(0)
+        paragraph_format.space_after = Pt(18)
+        paragraph_format.keep_with_next = True
+        for run in paragraph.runs:
+            set_run_font(run, preset["font"], preset["size"] + 4, True,
+                         preset["heading_color"])
+    elif kind == "subtitle":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.CENTER
+        paragraph_format.first_line_indent = Inches(0)
+        paragraph_format.keep_with_next = True
+        for run in paragraph.runs:
+            set_run_font(run, preset["font"], preset["size"], False,
+                         preset["heading_color"])
+    elif kind == "h1":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        paragraph_format.first_line_indent = Inches(0)
+        paragraph_format.space_before = Pt(16)
+        paragraph_format.space_after = Pt(8)
+        paragraph_format.keep_with_next = True
+        for run in paragraph.runs:
+            set_run_font(run, preset["font"], preset["size"] + 2, True,
+                         preset["heading_color"])
+    elif kind == "h2":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        paragraph_format.first_line_indent = Inches(0)
+        paragraph_format.space_before = Pt(12)
+        paragraph_format.space_after = Pt(6)
+        paragraph_format.keep_with_next = True
+        for run in paragraph.runs:
+            set_run_font(run, preset["font"], preset["size"] + 1, True,
+                         preset["heading_color"])
+    elif kind == "h3":
+        paragraph.alignment = WD_ALIGN_PARAGRAPH.LEFT
+        paragraph_format.first_line_indent = Inches(0)
+        paragraph_format.space_before = Pt(8)
+        paragraph_format.space_after = Pt(4)
+        paragraph_format.keep_with_next = True
+        for run in paragraph.runs:
+            set_run_font(run, preset["font"], preset["size"], True,
+                         preset["heading_color"])
+    else:
+        paragraph.alignment = ALIGNMENTS[preset["alignment"]]
+        paragraph_format.first_line_indent = Inches(preset["first_indent"])
+        paragraph_format.left_indent = Inches(0)
+        paragraph_format.right_indent = Inches(0)
+        for run in paragraph.runs:
+            # Preserve bold, italic and underline while standardising typography.
+            set_run_font(run, preset["font"], preset["size"])
+
+
+def format_document(input_path, output_path, preset, options):
+    doc = Document(input_path)
+
+    # Page layout for every section.
+    for section in doc.sections:
+        section.top_margin = Inches(preset["top"])
+        section.bottom_margin = Inches(preset["bottom"])
+        section.left_margin = Inches(preset["left"])
+        section.right_margin = Inches(preset["right"])
+
+    # Set document-wide default style.
+    normal = doc.styles["Normal"]
+    normal.font.name = preset["font"]
+    normal._element.rPr.rFonts.set(qn("w:eastAsia"), preset["font"])
+    normal.font.size = Pt(preset["size"])
+    normal.paragraph_format.line_spacing = preset["line"]
+    normal.paragraph_format.space_after = Pt(preset["after"])
+
+    counts = {"body": 0, "headings": 0, "tables": 0, "images": 0}
+    for paragraph in doc.paragraphs:
+        kind = paragraph_kind(paragraph)
+        apply_paragraph_format(paragraph, preset, kind)
+        if kind == "body":
+            counts["body"] += 1
+        elif kind in ("title", "subtitle", "h1", "h2", "h3"):
+            counts["headings"] += 1
+
+    # Format table text and add restrained borders without deleting table content.
+    for table in doc.tables:
+        counts["tables"] += 1
+        if options["style_tables"]:
+            table.alignment = WD_TABLE_ALIGNMENT.CENTER
+            table.autofit = True
+            for row_index, row in enumerate(table.rows):
+                for cell in row.cells:
+                    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+                    if row_index == 0:
+                        set_cell_shading(cell, "D9EAF7")
+                    for paragraph in cell.paragraphs:
+                        paragraph.paragraph_format.space_after = Pt(2)
+                        paragraph.paragraph_format.space_before = Pt(2)
+                        paragraph.paragraph_format.line_spacing = 1.0
+                        for run in paragraph.runs:
+                            set_run_font(run, preset["font"],
+                                         max(8, preset["size"] - 1),
+                                         True if row_index == 0 else None)
+                    border = {"val": "single", "sz": "4", "color": "B7C9D6"}
+                    set_cell_border(cell, top=border, bottom=border,
+                                    left=border, right=border)
+
+    # Count inline pictures. Existing pictures are not intentionally altered.
+    for paragraph in doc.paragraphs:
+        counts["images"] += len(paragraph._p.xpath(".//w:drawing"))
+
+    if options["page_numbers"]:
+        for section in doc.sections:
+            footer = section.footer
+            if not footer.paragraphs or not any(
+                "PAGE" in p._p.xml for p in footer.paragraphs
+            ):
+                p = footer.paragraphs[0] if footer.paragraphs else footer.add_paragraph()
+                set_page_number(p)
+
+    doc.core_properties.comments = (
+        (doc.core_properties.comments or "") +
+        "\nFormatted using Smart Document Formatter."
+    ).strip()
+
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    doc.save(output_path)
+    return counts
+
+
+class SmartDocumentFormatter:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Smart Document Formatter")
+        self.root.geometry("820x720")
+        self.root.minsize(720, 640)
+        self.input_path = tk.StringVar()
+        self.output_dir = tk.StringVar()
+        self.output_name = tk.StringVar(value="Formatted_Document.docx")
+        self.category = tk.StringVar(value="Academic Work")
+        self.preset = tk.StringVar(value="APA 7th Edition")
+        self.style_tables = tk.BooleanVar(value=True)
+        self.page_numbers = tk.BooleanVar(value=False)
+        self.status = tk.StringVar(value="Choose a Word document to get started.")
+        self._build_ui()
+        self._update_presets()
+
+    def _build_ui(self):
+        style = ttk.Style()
+        try:
+            style.theme_use("vista")
+        except tk.TclError:
+            pass
+
+        outer = ttk.Frame(self.root, padding=20)
+        outer.pack(fill="both", expand=True)
+
+        ttk.Label(outer, text="Smart Document Formatter",
+                  font=("Segoe UI", 21, "bold")).pack(anchor="w")
+        ttk.Label(outer,
+                  text="Apply professional formatting presets to Word documents.",
+                  font=("Segoe UI", 10)).pack(anchor="w", pady=(2, 18))
+
+        file_frame = ttk.LabelFrame(outer, text="1. Select your document", padding=12)
+        file_frame.pack(fill="x", pady=6)
+        row = ttk.Frame(file_frame)
+        row.pack(fill="x")
+        ttk.Entry(row, textvariable=self.input_path).pack(side="left", fill="x", expand=True)
+        ttk.Button(row, text="Browse...", command=self._browse_input).pack(side="left", padx=(8, 0))
+
+        format_frame = ttk.LabelFrame(outer, text="2. Choose formatting", padding=12)
+        format_frame.pack(fill="x", pady=6)
+        ttk.Label(format_frame, text="Document category").grid(row=0, column=0, sticky="w", pady=5)
+        category_box = ttk.Combobox(
+            format_frame, textvariable=self.category, state="readonly",
+            values=list(PRESETS.keys()), width=35
+        )
+        category_box.grid(row=0, column=1, sticky="ew", padx=10, pady=5)
+        category_box.bind("<<ComboboxSelected>>", lambda _e: self._update_presets())
+
+        ttk.Label(format_frame, text="Formatting preset").grid(row=1, column=0, sticky="w", pady=5)
+        self.preset_box = ttk.Combobox(
+            format_frame, textvariable=self.preset, state="readonly", width=35
+        )
+        self.preset_box.grid(row=1, column=1, sticky="ew", padx=10, pady=5)
+        format_frame.columnconfigure(1, weight=1)
+
+        options_frame = ttk.LabelFrame(outer, text="3. Additional options", padding=12)
+        options_frame.pack(fill="x", pady=6)
+        ttk.Checkbutton(options_frame, text="Apply clean formatting to tables",
+                        variable=self.style_tables).pack(anchor="w", pady=3)
+        ttk.Checkbutton(options_frame, text="Insert page numbers in footers",
+                        variable=self.page_numbers).pack(anchor="w", pady=3)
+        ttk.Label(options_frame,
+                  text="Text is not rewritten. Existing content is kept; review complex layouts after formatting.",
+                  foreground="#555").pack(anchor="w", pady=(6, 0))
+
+        output_frame = ttk.LabelFrame(outer, text="4. Save formatted document", padding=12)
+        output_frame.pack(fill="x", pady=6)
+        ttk.Label(output_frame, text="Output filename").grid(row=0, column=0, sticky="w", pady=5)
+        ttk.Entry(output_frame, textvariable=self.output_name).grid(
+            row=0, column=1, sticky="ew", padx=10, pady=5)
+        ttk.Label(output_frame, text="Save in folder").grid(row=1, column=0, sticky="w", pady=5)
+        folder_row = ttk.Frame(output_frame)
+        folder_row.grid(row=1, column=1, sticky="ew", padx=10, pady=5)
+        ttk.Entry(folder_row, textvariable=self.output_dir).pack(side="left", fill="x", expand=True)
+        ttk.Button(folder_row, text="Browse...", command=self._browse_output).pack(side="left", padx=(8, 0))
+        output_frame.columnconfigure(1, weight=1)
+
+        action_row = ttk.Frame(outer)
+        action_row.pack(fill="x", pady=(14, 8))
+        ttk.Button(action_row, text="Format Document",
+                   command=self._format).pack(side="left")
+        ttk.Button(action_row, text="Open Output Folder",
+                   command=self._open_output_folder).pack(side="left", padx=8)
+
+        ttk.Separator(outer).pack(fill="x", pady=8)
+        ttk.Label(outer, textvariable=self.status, wraplength=750,
+                  font=("Segoe UI", 9)).pack(anchor="w")
+        ttk.Label(outer,
+                  text="Supported input: .docx  |  Original file is never overwritten.",
+                  foreground="#666").pack(anchor="w", pady=(8, 0))
+
+    def _update_presets(self):
+        options = list(PRESETS[self.category.get()].keys())
+        self.preset_box["values"] = options
+        if self.preset.get() not in options:
+            self.preset.set(options[0])
+
+    def _browse_input(self):
+        path = filedialog.askopenfilename(
+            title="Select a Word document",
+            filetypes=[("Word documents", "*.docx"), ("All files", "*.*")]
+        )
+        if path:
+            self.input_path.set(path)
+            source = Path(path)
+            self.output_name.set(f"{source.stem}_Formatted.docx")
+            if not self.output_dir.get():
+                self.output_dir.set(str(source.parent))
+
+    def _browse_output(self):
+        path = filedialog.askdirectory(title="Choose output folder")
+        if path:
+            self.output_dir.set(path)
+
+    def _format(self):
+        source_text = self.input_path.get().strip()
+        output_dir = self.output_dir.get().strip()
+        output_name = self.output_name.get().strip()
+
+        if not source_text or not Path(source_text).is_file():
+            messagebox.showwarning("Select a document", "Please select an existing .docx file.")
+            return
+        if Path(source_text).suffix.lower() != ".docx":
+            messagebox.showerror("Unsupported file", "This version supports .docx files only.")
+            return
+        if not output_dir or not Path(output_dir).is_dir():
+            messagebox.showwarning("Choose a folder", "Please choose an output folder.")
+            return
+        if not output_name:
+            messagebox.showwarning("Filename required", "Enter an output filename.")
+            return
+        if not output_name.lower().endswith(".docx"):
+            output_name += ".docx"
+            self.output_name.set(output_name)
+        if any(c in output_name for c in '<>:"/\\|?*'):
+            messagebox.showerror("Invalid filename", "The output filename contains invalid characters.")
+            return
+
+        source = Path(source_text).resolve()
+        destination = (Path(output_dir) / output_name).resolve()
+        if source == destination:
+            messagebox.showerror("Choose another output", "The output must not overwrite the original file.")
+            return
+        if destination.exists():
+            if not messagebox.askyesno("Replace existing file?",
+                                       f"{destination.name} already exists. Replace it?"):
+                return
+
+        selected_preset = PRESETS[self.category.get()][self.preset.get()]
+        options = {
+            "style_tables": self.style_tables.get(),
+            "page_numbers": self.page_numbers.get(),
+        }
+        try:
+            self.status.set("Formatting document... Please wait.")
+            self.root.update_idletasks()
+            counts = format_document(source, destination, selected_preset, options)
+            self.status.set(f"Finished: {destination}")
+            messagebox.showinfo(
+                "Formatting complete",
+                "Your formatted document has been saved.\n\n"
+                f"File: {destination}\n\n"
+                f"Body paragraphs: {counts['body']}\n"
+                f"Detected headings: {counts['headings']}\n"
+                f"Tables: {counts['tables']}\n"
+                f"Images detected: {counts['images']}\n\n"
+                "Please review page breaks, images, tables and institutional requirements."
+            )
+        except Exception as exc:
+            self.status.set("Formatting failed.")
+            messagebox.showerror(
+                "Formatting error",
+                f"The document could not be formatted:\n\n{exc}\n\n"
+                "If the file is open in Word, close it and try again."
+            )
+
+    def _open_output_folder(self):
+        folder = self.output_dir.get().strip()
+        if folder and Path(folder).is_dir():
+            os.startfile(folder)
+        else:
+            messagebox.showwarning("No output folder", "Choose a valid output folder first.")
+
+
+def main():
+    root = tk.Tk()
+    SmartDocumentFormatter(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
